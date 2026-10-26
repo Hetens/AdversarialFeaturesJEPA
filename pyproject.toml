@@ -1,0 +1,9 @@
+[project]
+name = "adversarial-features-jepa"
+version = "0.1.0"
+description = "Adversarial slow features and inverse dynamics loss in JEPA models."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "ogbench>=1.2.1",
+]
