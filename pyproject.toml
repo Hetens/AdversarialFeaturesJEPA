@@ -7,4 +7,10 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "matplotlib>=3.11.2",
     "ogbench>=1.2.1",
+    "torch>=2.15.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
 ]
