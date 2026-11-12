@@ -5,5 +5,6 @@ description = "Adversarial slow features and inverse dynamics loss in JEPA model
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "matplotlib>=3.11.2",
     "ogbench>=1.2.1",
 ]
