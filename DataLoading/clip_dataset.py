@@ -62,6 +62,29 @@ def action_stats(dataset: dict) -> tuple[np.ndarray, np.ndarray]:
     return actions.mean(0), actions.std(0) + 1e-6
 
 
+def stamp_square(frames: np.ndarray, colors: np.ndarray, size: int = 5) -> np.ndarray:
+    """Write each frame's color into its top-left size x size corner, in place.
+
+    frames: (T, H, W, 3) uint8, colors: (T, 3) uint8.
+    """
+    frames[:, :size, :size, :] = colors[:, None, None, :]  # (T, 3) -> (T, 1, 1, 3)
+    return frames
+
+
+def preprocess_frames(frames: np.ndarray, img_size: int | None = None) -> torch.Tensor:
+    """(T, H, W, 3) uint8 -> (T, 3, H, W) float, ImageNet-normalized; (T, 3, S, S) if resized."""
+    pixels = torch.from_numpy(np.ascontiguousarray(frames)).permute(0, 3, 1, 2).float().div_(255)
+    if img_size is not None and pixels.shape[-1] != img_size:
+        pixels = F.interpolate(
+            pixels,
+            size=(img_size, img_size),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+    return (pixels - IMAGENET_MEAN) / IMAGENET_STD
+
+
 class ClipDataset(Dataset):
     """Clips of ``{"pixels": (T, 3, H, W) float, "action": (T, frameskip * A) float}``.
 
@@ -112,20 +135,8 @@ class ClipDataset(Dataset):
         # Fancy indexing returns a copy, so stamping never touches the source.
         frames = self.observations[frame_idx]  # (T, H, W, 3) uint8
         if self.colors is not None:
-            n = self.square_size
-            # (T, 3) -> (T, 1, 1, 3), broadcast over the n x n corner
-            frames[:, :n, :n, :] = self.colors[frame_idx][:, None, None, :]
-
-        pixels = torch.from_numpy(frames).permute(0, 3, 1, 2).float().div_(255)  # (T, 3, H, W) in [0, 1]
-        if self.img_size is not None and pixels.shape[-1] != self.img_size:  # -> (T, 3, S, S)
-            pixels = F.interpolate(
-                pixels,
-                size=(self.img_size, self.img_size),
-                mode="bilinear",
-                align_corners=False,
-                antialias=True,
-            )
-        pixels = (pixels - IMAGENET_MEAN) / IMAGENET_STD  # same shape, ImageNet-normalized
+            stamp_square(frames, self.colors[frame_idx], self.square_size)
+        pixels = preprocess_frames(frames, self.img_size)  # (T, 3, H, W) or (T, 3, S, S)
 
         # (span, A) -> (T, fs * A): row k holds the fs raw actions after kept frame k
         action = torch.from_numpy(

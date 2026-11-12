@@ -3,4 +3,5 @@ __pycache__/
 *.py[cod]
 .DS_Store
 Data/ogbench/
+runs/
 structure.txt
