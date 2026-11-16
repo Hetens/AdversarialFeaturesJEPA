@@ -5,6 +5,12 @@
     python scripts/train.py --square-mode frame    --run-name frame_s0
 
 Writes runs/<run-name>/{config.json, metrics.jsonl, last.pt, epoch_XXX.pt}.
+last.pt holds optimizer and scheduler state too; rerunning the same command
+resumes from it (so preempted Slurm jobs can simply be requeued).
+
+Images are memory-mapped: the first run extracts each .npz's observations.npy
+(uncompressed, ~12 GB for train) next to it, and later runs map it instead of
+loading it into RAM.
 """
 
 from __future__ import annotations
@@ -12,8 +18,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import resource
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -65,10 +73,44 @@ def pick_device(name: str) -> torch.device:
 
 
 def load_split(dataset: str, data_dir: Path, split: str) -> dict:
-    path = data_dir / (f"{dataset}.npz" if split == "train" else f"{dataset}-val.npz")
+    """Same dict as ogbench.load_dataset(..., compact_dataset=True), with
+    observations memory-mapped instead of loaded into RAM."""
+    stem = dataset if split == "train" else f"{dataset}-val"
+    path = data_dir / f"{stem}.npz"
     if not path.exists():
         ogbench.download_datasets([dataset], dataset_dir=str(data_dir))
-    return ogbench.load_dataset(str(path), ob_dtype=np.uint8, action_dtype=np.float32, compact_dataset=True)
+
+    cache = data_dir / f"{stem}_mmap"
+    cache.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path) as z:
+        for name in ("observations.npy", "actions.npy", "terminals.npy"):
+            if not (cache / name).exists():
+                print(f"extracting {path.name}:{name} -> {cache}")
+                tmp = cache / f"{name}.partial"
+                with z.open(name) as src, open(tmp, "wb") as dst:
+                    while chunk := src.read(64 << 20):
+                        dst.write(chunk)
+                tmp.rename(cache / name)
+
+    observations = np.load(cache / "observations.npy", mmap_mode="r")  # (N, H, W, 3) uint8, on disk
+    actions = np.load(cache / "actions.npy").astype(np.float32, copy=False)
+    terminals = np.load(cache / "terminals.npy").astype(np.float32, copy=False)
+    # OGBench's compact layout: valids marks each episode's last frame with 0,
+    # terminals is set on the last two frames.
+    valids = 1.0 - terminals
+    terminals = np.minimum(terminals + np.concatenate([terminals[1:], [1.0]]), 1.0).astype(np.float32)
+    return {"observations": observations, "actions": actions, "terminals": terminals, "valids": valids}
+
+
+def peak_memory(device: torch.device) -> dict[str, float]:
+    """Peak GPU memory (allocated by tensors / reserved by the allocator) and peak RSS, in GB."""
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_gb = rss / 2**30 if sys.platform == "darwin" else rss / 2**20  # bytes on macOS, KB on Linux
+    out = {"mem/rss_peak_gb": rss_gb}
+    if device.type == "cuda":
+        out["mem/gpu_alloc_peak_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
+        out["mem/gpu_reserved_peak_gb"] = torch.cuda.max_memory_reserved(device) / 2**30
+    return out
 
 
 def warmup_cosine(total_steps: int, warmup_steps: int):
@@ -145,9 +187,12 @@ def main():
         optimizer, warmup_cosine(total_steps, max(1, int(args.warmup_frac * total_steps)))
     )
 
-    # bf16 autocast on CUDA as upstream; plain fp32 elsewhere.
+    # bf16 autocast as upstream, only where the GPU supports it natively (Ampere+); fp32 otherwise.
+    use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported(including_emulation=False)
+    print(f"bf16 autocast: {use_bf16}")
+
     def autocast():
-        return torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda")
+        return torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16)
 
     run_config = {"model": model_config, "train": {k: v for k, v in vars(args).items() if k not in DEFAULT_CONFIG},
                   "action_mean": mean.tolist(), "action_std": std.tolist()}
@@ -158,9 +203,18 @@ def main():
         metrics_file.write(json.dumps(record) + "\n")
         metrics_file.flush()
 
-    step = 0
+    step, start_epoch = 0, 0
+    last_path = run_dir / "last.pt"
+    if last_path.exists():
+        state = torch.load(last_path, map_location=device, weights_only=False)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        step, start_epoch = state["step"], state["epoch"] + 1
+        print(f"resumed from {last_path} at epoch {start_epoch}, step {step}")
+
     model.train()
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
         for i, batch in enumerate(train_loader):
             if i >= steps_per_epoch:
@@ -183,13 +237,19 @@ def main():
                       f"pred {record['train/pred_loss']:.4f}  sigreg {record['train/sigreg_loss']:.3f}  "
                       f"lr {record['lr']:.2e}")
 
+        train_time = time.time() - t0
         val = validate(model, val_loader, device, autocast, args.max_val_batches)
-        log({"step": step, "epoch": epoch, **val})
-        print(f"epoch {epoch} done in {time.time() - t0:.0f}s  " + "  ".join(f"{k} {v:.4f}" for k, v in val.items()))
+        mem = peak_memory(device)
+        log({"step": step, "epoch": epoch, "train_steps_per_s": steps_per_epoch / train_time, **val, **mem})
+        print(f"epoch {epoch} done in {time.time() - t0:.0f}s ({steps_per_epoch / train_time:.1f} steps/s)  "
+              + "  ".join(f"{k} {v:.4f}" for k, v in {**val, **mem}.items()))
 
         ckpt = {"model": model.state_dict(), "config": run_config, "epoch": epoch, "step": step}
         torch.save(ckpt, run_dir / f"epoch_{epoch:03d}.pt")
-        torch.save(ckpt, run_dir / "last.pt")
+        # Write-then-rename so a preemption mid-save never leaves a corrupt last.pt.
+        torch.save({**ckpt, "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()},
+                   run_dir / "last.pt.tmp")
+        (run_dir / "last.pt.tmp").replace(last_path)
 
     metrics_file.close()
 
