@@ -6,3 +6,4 @@ Data/ogbench/
 runs/
 .uv-cache/
 structure.txt
+/docs/lewm_*.md

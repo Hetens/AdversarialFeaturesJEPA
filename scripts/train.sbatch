@@ -12,10 +12,10 @@
 #SBATCH --job-name=lewm
 #SBATCH --partition=gpu-preempt
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=PLACEHOLDER
-#SBATCH --cpus-per-task=4
+#SBATCH --constraint=2080ti
+#SBATCH --cpus-per-task=6
 #SBATCH --mem=8G
-#SBATCH --time=4:00:00
+#SBATCH --time=8:00:00
 #SBATCH --array=0-2
 #SBATCH --requeue
 #SBATCH --open-mode=append
