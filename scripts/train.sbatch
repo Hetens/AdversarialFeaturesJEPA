@@ -5,6 +5,7 @@
 #   SEED=1 sbatch scripts/train.sbatch                                  # another seed
 #   sbatch --array=1 scripts/train.sbatch                               # only the episode arm
 #   sbatch --array=0 --time=0:20:00 scripts/train.sbatch --epochs 1 --max-steps-per-epoch 300 --run-name profile
+#   PREFIX=hjepa_ sbatch --job-name=hjepa --time=12:00:00 scripts/train.sbatch --model hjepa   # runs/hjepa_<mode>_s0
 #
 # Extra arguments are passed through to scripts/train.py. Jobs on gpu-preempt can be
 # preempted; --requeue restarts them and train.py resumes from runs/<run>/last.pt.
@@ -40,5 +41,5 @@ SMI_PID=$!
 trap 'kill $SMI_PID 2>/dev/null || true' EXIT
 
 uv run --frozen python scripts/train.py \
-    --square-mode "$MODE" --seed "$SEED" --run-name "${MODE}_s${SEED}" \
+    --square-mode "$MODE" --seed "$SEED" --run-name "${PREFIX:-}${MODE}_s${SEED}" \
     --num-workers $((SLURM_CPUS_PER_TASK - 1)) "$@"

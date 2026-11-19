@@ -13,6 +13,10 @@ Writes analysis_<checkpoint stem>.json next to the checkpoint. Three measurement
   rollout      predictor rolled out L blocks from one frame in the model's own
                square mode; error vs encoded ground truth, next to a "copy the
                first embedding" baseline.
+
+For H-JEPA checkpoints, ``--level 2`` runs all three on level-2 embeddings E2(z1);
+the rollout then steps 2 level-1 blocks (10 env steps) per prediction, driven by
+macro-actions, and writes analysis_l2_<stem>.json.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from DataLoading.clip_dataset import episode_ids, preprocess_frames, square_colors, stamp_square  # noqa: E402
-from lewm.jepa import build_lewm  # noqa: E402
+from lewm.hjepa import build_model  # noqa: E402
 from scripts.train import load_split, pick_device  # noqa: E402
 
 ARM_JOINTS = slice(0, 4)   # UR5e shoulder/elbow/wrist-1 angles; joint 4 is ~constant, joint 5 wraps
@@ -39,6 +43,7 @@ CUBE_XYZ = slice(-7, -4)   # cube free joint: xyz then quaternion, last in qpos
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", required=True)
+    p.add_argument("--level", type=int, choices=[1, 2], default=1, help="2 = H-JEPA level-2 embeddings")
     p.add_argument("--data-dir", default=str(REPO_ROOT / "Data" / "ogbench"))
     p.add_argument("--probe-frames", type=int, default=6000)
     p.add_argument("--sens-frames", type=int, default=500)
@@ -54,12 +59,12 @@ def parse_args():
 
 
 @torch.no_grad()
-def encode(model, frames: np.ndarray, img_size: int, device, batch_size: int) -> torch.Tensor:
-    """(N, H, W, 3) uint8 -> (N, D) on CPU."""
+def encode(encode_fn, frames: np.ndarray, img_size: int, device, batch_size: int) -> torch.Tensor:
+    """(N, H, W, 3) uint8 -> (N, D) on CPU; encode_fn maps (B, 1, 3, H, W) -> (B, 1, D)."""
     out = []
     for i in range(0, len(frames), batch_size):
         pixels = preprocess_frames(frames[i : i + batch_size], img_size)  # (B, 3, H, W)
-        out.append(model.encode(pixels[:, None].to(device))[:, 0].float().cpu())
+        out.append(encode_fn(pixels[:, None].to(device))[:, 0].float().cpu())
     return torch.cat(out)
 
 
@@ -84,17 +89,26 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     run_config, cfg = ckpt["config"], ckpt["config"]["model"]
     train_cfg = run_config["train"]
-    model = build_lewm(cfg)
+    model = build_model(cfg)
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()
     img_size, size, fs = cfg["img_size"], train_cfg["square_size"], cfg["frameskip"]
+    hjepa = cfg.get("model") == "hjepa"
+    if args.level == 2 and not hjepa:
+        raise SystemExit("--level 2 needs an H-JEPA checkpoint")
+    lewm = model.level1 if hjepa else model
+    if args.level == 2:
+        encode_fn = lambda pixels: model.encode2(lewm.encode(pixels))  # noqa: E731
+        blocks_per_step = model.stride2
+    else:
+        encode_fn, blocks_per_step = lewm.encode, 1
 
     stem = f"{train_cfg['dataset']}-val"
     data = load_split(train_cfg["dataset"], Path(args.data_dir), "val")
     qpos = np.load(Path(args.data_dir) / f"{stem}.npz")["qpos"]  # (N, 21)
     obs = data["observations"]                                      # (N, H, W, 3) uint8, mmap
     episodes = episode_ids(data)                                    # (N,)
-    enc = lambda frames: encode(model, frames, img_size, device, args.batch_size)  # noqa: E731
+    enc = lambda frames: encode(encode_fn, frames, img_size, device, args.batch_size)  # noqa: E731
     random_colors = lambda n: rng.integers(0, 256, size=(n, 3), dtype=np.uint8)    # noqa: E731
 
     # Probes
@@ -132,12 +146,12 @@ def main():
     }
 
     # Rollout in the model's own square mode
-    L = args.rollout_steps
-    span = (L + 1) * fs
+    L, step = args.rollout_steps, fs * blocks_per_step              # env steps per prediction
+    span = L * step + fs
     starts = np.arange(len(obs) - span + 1)
     starts = starts[episodes[starts] == episodes[starts + span - 1]]
     starts = rng.choice(starts, args.rollout_clips, replace=False)
-    frame_idx = starts[:, None] + fs * np.arange(L + 1)             # (C, L+1)
+    frame_idx = starts[:, None] + step * np.arange(L + 1)           # (C, L+1)
     frames = obs[frame_idx.reshape(-1)]                             # (C*(L+1), H, W, 3)
     own = square_colors(data, train_cfg["square_mode"], train_cfg["seed"] + 1)
     if own is not None:
@@ -145,13 +159,21 @@ def main():
     true = enc(frames).view(len(starts), L + 1, -1)                 # (C, L+1, D)
     mean = np.tile(run_config["action_mean"], fs)
     std = np.tile(run_config["action_std"], fs)
-    acts = data["actions"][starts[:, None] + np.arange(L * fs)].reshape(len(starts), L, -1)
-    acts = torch.from_numpy(((acts - mean) / std).astype(np.float32))  # (C, L, fs*A)
+    acts = data["actions"][starts[:, None] + np.arange(L * step)].reshape(len(starts), L * blocks_per_step, -1)
+    acts = torch.from_numpy(((acts - mean) / std).astype(np.float32))  # (C, L*blocks_per_step, fs*A)
+
+    def predict_rollout(e0: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        if args.level == 1:
+            return lewm.rollout(e0, a)
+        a1 = lewm.encode_actions(a)                                  # (B, L*s, D)
+        macros = model.macro_encoder(a1.view(len(a), L, blocks_per_step, -1))
+        return model.rollout2(e0, macros)
+
     preds = []
     with torch.no_grad():
         for i in range(0, len(starts), args.batch_size):
             e0 = true[i : i + args.batch_size, :1].to(device)
-            preds.append(model.rollout(e0, acts[i : i + args.batch_size].to(device))[:, 1:].float().cpu())
+            preds.append(predict_rollout(e0, acts[i : i + args.batch_size].to(device))[:, 1:].float().cpu())
     pred = torch.cat(preds)                                         # (C, L, D)
     target = true[:, 1:]
     emb_var = true.reshape(-1, true.shape[-1]).var(0).sum()
@@ -163,9 +185,12 @@ def main():
     rollout["relative_mse_per_step"] = [m / float(emb_var) for m in rollout["mse_per_step"]]
     rollout["model_over_copy_per_step"] = [m / c for m, c in zip(rollout["mse_per_step"], rollout["copy_mse_per_step"])]
 
-    summary = {"checkpoint": str(args.checkpoint), "square_mode": train_cfg["square_mode"],
+    summary = {"checkpoint": str(args.checkpoint), "square_mode": train_cfg["square_mode"], "level": args.level,
                "probes": probes, "sensitivity": sensitivity, "rollout": rollout, "args": vars(args)}
-    out = Path(args.out) if args.out else Path(args.checkpoint).with_name(f"analysis_{Path(args.checkpoint).stem}.json")
+    level_tag = "l2_" if args.level == 2 else ""
+    out = Path(args.out) if args.out else Path(args.checkpoint).with_name(
+        f"analysis_{level_tag}{Path(args.checkpoint).stem}.json"
+    )
     out.write_text(json.dumps(summary, indent=2))
     print(json.dumps({k: summary[k] for k in ("square_mode", "sensitivity")}, indent=2))
     print({k: round(v["mean"], 3) for k, v in probes.items()})

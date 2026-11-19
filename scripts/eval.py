@@ -19,6 +19,13 @@ Task sets:
 The corner square is applied to env frames exactly as in training: one color
 per eval episode (also on the goal frame) for ``episode``, a fresh color every
 frame for ``frame``, none for ``baseline``.
+
+H-JEPA checkpoints (``--planner``):
+  hier        top-down: level 2 plans ``horizon2`` macro-actions to the goal, its first
+              predicted state is the subgoal for ``stride2`` level-1 blocks
+              (run with ``--receding 2``)
+  flat        level 1 alone, exactly like LeWM
+  l2_project  level-1 planning with the cost measured after E2 (level-2 space)
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from DataLoading.clip_dataset import episode_ids, preprocess_frames, stamp_square  # noqa: E402
-from lewm.jepa import build_lewm  # noqa: E402
+from lewm.hjepa import build_model  # noqa: E402
 from planning.cem import CEM  # noqa: E402
 from scripts.train import load_split  # noqa: E402
 
@@ -55,6 +62,9 @@ def parse_args():
     p.add_argument("--max-steps", type=int, default=200, help="env steps per episode (OGBench uses 200)")
     p.add_argument("--horizon", type=int, default=5, help="planned action blocks (model steps)")
     p.add_argument("--receding", type=int, default=5, help="blocks executed before replanning")
+    p.add_argument("--planner", choices=["hier", "flat", "l2_project"], default="hier",
+                   help="H-JEPA checkpoints only; LeWM always plans flat")
+    p.add_argument("--horizon2", type=int, default=3, help="H-JEPA: level-2 steps planned (hier)")
     p.add_argument("--samples", type=int, default=300)
     p.add_argument("--topk", type=int, default=30)
     p.add_argument("--iters", type=int, default=30)
@@ -152,9 +162,12 @@ def main():
     run_config = ckpt["config"]
     cfg = run_config["model"]
     train_cfg = run_config["train"]
-    model = build_lewm(cfg)
+    model = build_model(cfg)
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()
+    hjepa = cfg.get("model") == "hjepa"
+    lewm = model.level1 if hjepa else model
+    planner_mode = args.planner if hjepa else "flat"
 
     frameskip, action_dim = cfg["frameskip"], cfg["action_dim"]
     block_dim = frameskip * action_dim
@@ -167,12 +180,30 @@ def main():
     env = ogbench.make_env_and_datasets(train_cfg["dataset"], env_only=True)
     bounds = env.unwrapped._target_sampling_bounds
     planner = CEM(num_samples=args.samples, topk=args.topk, iters=args.iters)
+    # Macro-actions are layer-normalized inside the model, so a wider box than raw actions.
+    top_planner = CEM(num_samples=args.samples, topk=args.topk, iters=args.iters, low=-3.0, high=3.0)
     if args.tasks == "dataset":
         dataset_tasks = DatasetTasks(env, train_cfg["dataset"], Path(args.data_dir), args.goal_offset)
 
     def embed(frame: np.ndarray) -> torch.Tensor:
         pixels = preprocess_frames(tagger(frame)[None], cfg["img_size"])  # (1, 3, H, W)
-        return model.encode(pixels[None].to(device))                      # (1, 1, D)
+        return lewm.encode(pixels[None].to(device))                       # (1, 1, D) level 1
+
+    def plan_actions(emb: torch.Tensor, goal_emb: torch.Tensor) -> torch.Tensor:
+        """Raw action blocks to execute from the current embedding, (blocks, block_dim)."""
+        if planner_mode == "flat":
+            return planner.plan(lambda c: lewm.plan_cost(emb, goal_emb, (c - mean) / std),
+                                args.horizon, block_dim, device=device)
+        goal2 = model.encode2(goal_emb)  # (1, 1, D)
+        if planner_mode == "l2_project":
+            return planner.plan(lambda c: model.low_cost(emb, goal2[:, 0], (c - mean) / std),
+                                args.horizon, block_dim, device=device)
+        z2 = model.encode2(emb)
+        macros = top_planner.plan(lambda m: model.top_cost(z2, goal2, m),
+                                  args.horizon2, cfg["macro_dim"], device=device)
+        subgoal = model.rollout2(z2, macros[None])[:, 1]  # first predicted level-2 state, (1, D)
+        return planner.plan(lambda c: model.low_cost(emb, subgoal, (c - mean) / std),
+                            cfg["stride2"], block_dim, device=device)
 
     results = []
     t0 = time.time()
@@ -198,12 +229,7 @@ def main():
 
         success, steps = False, 0
         while steps < args.max_steps and not success:
-            emb = embed(ob)
-
-            def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
-                return model.plan_cost(emb, goal_emb, (candidates - mean) / std)
-
-            plan = planner.plan(cost_fn, args.horizon, block_dim, device=device)  # (horizon, block_dim) raw
+            plan = plan_actions(embed(ob), goal_emb)                                   # (blocks, block_dim) raw
             raw_actions = plan[: args.receding].reshape(-1, action_dim).cpu().numpy()  # (receding * fs, A)
             for action in raw_actions:
                 ob, _, terminated, truncated, info = env.step(action)
@@ -231,6 +257,7 @@ def main():
         "checkpoint": str(args.checkpoint),
         "square_mode": square_mode,
         "tasks": args.tasks,
+        "planner": planner_mode,
         "success_rate": float(np.mean([r["success"] for r in results])),
         "per_task": {k: float(np.mean(v)) for k, v in per_task.items()},
         **({f"mean_{k}": float(np.mean([r[k] for r in results]))
@@ -239,8 +266,9 @@ def main():
         "args": vars(args),
         "episodes": results,
     }
+    planner_tag = f"{planner_mode}_" if hjepa else ""
     out = Path(args.out) if args.out else Path(args.checkpoint).with_name(
-        f"eval_{args.tasks}_{Path(args.checkpoint).stem}.json"
+        f"eval_{args.tasks}_{planner_tag}{Path(args.checkpoint).stem}.json"
     )
     out.write_text(json.dumps(summary, indent=2))
     print(f"success rate {summary['success_rate']:.2%}  per task {summary['per_task']}  -> {out}")
