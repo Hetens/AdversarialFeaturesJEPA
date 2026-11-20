@@ -4,6 +4,8 @@
     python scripts/train.py --square-mode episode  --run-name episode_s0
     python scripts/train.py --square-mode frame    --run-name frame_s0
     python scripts/train.py --model hjepa --square-mode episode --run-name hjepa_episode_s0
+    python scripts/train.py --idm-weight 100 --square-mode episode                         # runs/idm_episode_s0
+    python scripts/train.py --model hjepa --idm-weight 100 --idm-weight2 50 --square-mode episode
 
 Writes runs/<run-name>/{config.json, metrics.jsonl, last.pt, epoch_XXX.pt}.
 last.pt holds optimizer and scheduler state too; rerunning the same command
@@ -150,7 +152,8 @@ def main():
     np.random.seed(args.seed)
     device = pick_device(args.device)
     hjepa = args.model == "hjepa"
-    run_name = args.run_name or f"{'hjepa_' if hjepa else ''}{args.square_mode}_s{args.seed}"
+    idm = args.idm_weight > 0 or args.idm_weight2 > 0
+    run_name = args.run_name or f"{'hjepa_' if hjepa else ''}{'idm_' if idm else ''}{args.square_mode}_s{args.seed}"
     run_dir = Path(args.runs_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -248,11 +251,12 @@ def main():
                 record = {"step": step, "epoch": epoch, "lr": scheduler.get_last_lr()[0],
                           "grad_norm": grad_norm.item(), **{f"train/{k}": v.item() for k, v in out.items()}}
                 log(record)
-                level2 = (f"pred2 {record['train/pred_loss2']:.4f}  sigreg2 {record['train/sigreg_loss2']:.3f}  "
-                          if hjepa else "")
+                extra = "".join(f"{name} {record[f'train/{key}']:.4f}  " for key, name in
+                                (("pred_loss2", "pred2"), ("sigreg_loss2", "sigreg2"),
+                                 ("idm_loss", "idm"), ("idm_loss2", "idm2")) if f"train/{key}" in record)
                 print(f"ep {epoch} step {step}/{total_steps}  loss {record['train/loss']:.4f}  "
                       f"pred {record['train/pred_loss']:.4f}  sigreg {record['train/sigreg_loss']:.3f}  "
-                      f"{level2}lr {record['lr']:.2e}")
+                      f"{extra}lr {record['lr']:.2e}")
 
         train_time = time.time() - t0
         val = validate(model, val_loader, device, autocast, args.max_val_batches)

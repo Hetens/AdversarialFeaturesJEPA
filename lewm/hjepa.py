@@ -9,6 +9,10 @@ One clip = 7 level-1 frames (frameskip 5, so 35 env steps):
   level 1: a random crop of 4 consecutive states, exactly LeWM's loss
   level 2: z2_t = E2(z1_{2t}) for t = 0..3, a2_t = A2(a1_{2t}, a1_{2t+1}) for t = 0..2
 
+With ``idm_weight`` / ``idm_weight2`` > 0 each level also gets the inverse-dynamics
+term of the paper's Eq. 8: level 1 regresses the primitive action block, level 2
+the detached macro-action (DROID weights: 100 and 50).
+
 Planning is top-down: level 2 plans macro-actions toward the goal's level-2
 embedding, its first predicted state becomes a subgoal, and level 1 plans
 ``stride2`` primitive blocks whose final prediction, lifted by E2, matches it.
@@ -21,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lewm.jepa import DEFAULT_CONFIG, JEPA, build_lewm
-from lewm.layers import MLP, Block
+from lewm.layers import MLP, Block, IDMHead
 from lewm.predictor import ARPredictor
 
 HJEPA_CONFIG = dict(
@@ -35,6 +39,7 @@ HJEPA_CONFIG = dict(
     predictor2_dim_head=64,
     predictor2_mlp_dim=2048,
     sigreg_weight2=0.09,
+    idm_weight2=0.0,
 )
 
 
@@ -80,8 +85,12 @@ class HJEPA(nn.Module):
         pred_proj2: MLP,
         stride2: int = 2,
         sigreg_weight2: float = 0.09,
+        idm2: IDMHead | None = None,
+        idm_weight2: float = 0.0,
     ):
         super().__init__()
+        self.idm2 = idm2
+        self.idm_weight2 = idm_weight2
         self.level1 = level1
         self.encoder2 = encoder2
         self.macro_encoder = macro_encoder
@@ -126,8 +135,16 @@ class HJEPA(nn.Module):
         sigreg_loss2 = m1.sigreg(z2.transpose(0, 1))
 
         loss = pred_loss + m1.sigreg_weight * sigreg_loss + pred_loss2 + self.sigreg_weight2 * sigreg_loss2
-        return {"loss": loss, "pred_loss": pred_loss, "sigreg_loss": sigreg_loss,
-                "pred_loss2": pred_loss2, "sigreg_loss2": sigreg_loss2}
+        out = {"pred_loss": pred_loss, "sigreg_loss": sigreg_loss,
+               "pred_loss2": pred_loss2, "sigreg_loss2": sigreg_loss2}
+        if m1.idm is not None:
+            out["idm_loss"] = m1.idm_loss(z1c, batch["action"][:, r : r + H + 1])
+            loss = loss + m1.idm_weight * out["idm_loss"]
+        if self.idm2 is not None:
+            # Detached target: the gradient reaches the encoders only through the two states.
+            out["idm_loss2"] = (self.idm2(z2[:, :-1], z2[:, 1:]) - macro.detach()).pow(2).mean()
+            loss = loss + self.idm_weight2 * out["idm_loss2"]
+        return {"loss": loss, **out}
 
     @torch.no_grad()
     def rollout2(self, z2: torch.Tensor, macros: torch.Tensor) -> torch.Tensor:
@@ -172,6 +189,8 @@ def build_hjepa(config: dict | None = None) -> HJEPA:
         pred_proj2=MLP(D, cfg["proj_hidden"], D),
         stride2=cfg["stride2"],
         sigreg_weight2=cfg["sigreg_weight2"],
+        idm2=IDMHead(D, cfg["idm_hidden"], cfg["macro_dim"]) if cfg["idm_weight2"] > 0 else None,
+        idm_weight2=cfg["idm_weight2"],
     )
 
 

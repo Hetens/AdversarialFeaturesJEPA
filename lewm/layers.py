@@ -88,6 +88,23 @@ class ConditionalBlock(nn.Module):
         x = x + gate2 * self.feed_forward(self.norm2(x) * (1 + scale2) + shift2)
         return x
 
+class IDMHead(nn.Module):
+    """Inverse-dynamics head: regresses the action that links two consecutive embeddings."""
+
+    def __init__(self, dim, hidden_dim, action_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, action_dim),
+        )
+
+    def forward(self, z, z_next):
+        # z, z_next: (B, T, dim) -> (B, T, action_dim)
+        return self.net(torch.cat([z, z_next], dim=-1))
+
 class MLP(nn.Module):
     """Projector head (used as ``projector`` after the encoder and ``pred_proj``
     after the predictor). BatchNorm1d needs 2-D input, so leading dims are

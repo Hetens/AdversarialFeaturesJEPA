@@ -3,6 +3,7 @@
 Training:  pixels -> encode -> emb (B, T, D); actions -> act_emb (B, T, D)
            pred = predict(emb[:, :H], act_emb[:, :H]) vs target emb[:, num_preds:]
            loss = MSE(pred, target) + sigreg_weight * SIGReg(emb)
+                  [+ idm_weight * MSE(IDM(emb_t, emb_t+1), action_t)   if idm_weight > 0]
 Planning:  encode the current frame and the goal frame, roll the predictor
            forward under candidate action sequences, and score each candidate by
            the distance of its final predicted embedding to the goal embedding.
@@ -15,7 +16,7 @@ import torch.nn as nn
 
 from lewm.action_encoder import ActionEncoder
 from lewm.encoder import Encoder
-from lewm.layers import MLP
+from lewm.layers import MLP, IDMHead
 from lewm.predictor import ARPredictor
 from lewm.sigreg import SIGReg
 
@@ -41,6 +42,9 @@ DEFAULT_CONFIG = dict(
     sigreg_weight=0.09,
     sigreg_knots=17,
     sigreg_num_proj=1024,
+    # Inverse dynamics (H-JEPA paper, Eq. 8; weight 100 on DROID). 0 disables it.
+    idm_weight=0.0,
+    idm_hidden=512,
 )
 
 
@@ -55,6 +59,8 @@ class JEPA(nn.Module):
         history_size: int = 3,
         num_preds: int = 1,
         sigreg_weight: float = 0.09,
+        idm: IDMHead | None = None,
+        idm_weight: float = 0.0,
     ):
         super().__init__()
         self.encoder = encoder
@@ -65,6 +71,13 @@ class JEPA(nn.Module):
         self.history_size = history_size
         self.num_preds = num_preds
         self.sigreg_weight = sigreg_weight
+        self.idm = idm
+        self.idm_weight = idm_weight
+
+    def idm_loss(self, emb: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """emb (B, T, D), actions (B, T, frameskip * A) normalized; action t links emb t -> t + 1.
+        Mean over the T - 1 pairs and the action dims."""
+        return (self.idm(emb[:, :-1], emb[:, 1:]) - actions[:, :-1]).pow(2).mean()
 
     def encode(self, pixels: torch.Tensor) -> torch.Tensor:
         """(B, T, 3, H, W) -> (B, T, D) projected frame embeddings."""
@@ -92,7 +105,11 @@ class JEPA(nn.Module):
         pred_loss = (pred - target).pow(2).mean()
         sigreg_loss = self.sigreg(emb.transpose(0, 1))   # SIGReg wants (T, B, D)
         loss = pred_loss + self.sigreg_weight * sigreg_loss
-        return {"loss": loss, "pred_loss": pred_loss, "sigreg_loss": sigreg_loss}
+        out = {"pred_loss": pred_loss, "sigreg_loss": sigreg_loss}
+        if self.idm is not None:
+            out["idm_loss"] = self.idm_loss(emb, batch["action"])
+            loss = loss + self.idm_weight * out["idm_loss"]
+        return {"loss": loss, **out}
 
     @torch.no_grad()
     def rollout(self, emb: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -167,4 +184,6 @@ def build_lewm(config: dict | None = None) -> JEPA:
         history_size=cfg["history_size"],
         num_preds=cfg["num_preds"],
         sigreg_weight=cfg["sigreg_weight"],
+        idm=IDMHead(D, cfg["idm_hidden"], cfg["frameskip"] * cfg["action_dim"]) if cfg["idm_weight"] > 0 else None,
+        idm_weight=cfg["idm_weight"],
     )

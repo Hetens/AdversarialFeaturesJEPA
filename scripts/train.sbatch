@@ -6,6 +6,8 @@
 #   sbatch --array=1 scripts/train.sbatch                               # only the episode arm
 #   sbatch --array=0 --time=0:20:00 scripts/train.sbatch --epochs 1 --max-steps-per-epoch 300 --run-name profile
 #   PREFIX=hjepa_ sbatch --job-name=hjepa --time=12:00:00 scripts/train.sbatch --model hjepa   # runs/hjepa_<mode>_s0
+#   PREFIX=idm_ sbatch --job-name=idm scripts/train.sbatch --idm-weight 100                    # runs/idm_<mode>_s0
+#   PREFIX=hjepa_idm_ sbatch --job-name=hjepa-idm --time=12:00:00 scripts/train.sbatch --model hjepa --idm-weight 100 --idm-weight2 50
 #
 # Extra arguments are passed through to scripts/train.py. Jobs on gpu-preempt can be
 # preempted; --requeue restarts them and train.py resumes from runs/<run>/last.pt.
